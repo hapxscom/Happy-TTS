@@ -1,14 +1,25 @@
-import { useState, useCallback } from 'react';
-import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+import { useState, useCallback, useEffect } from 'react';
+import { 
+    startRegistration, 
+    startAuthentication, 
+    browserSupportsWebAuthn, 
+    browserSupportsWebAuthnAutofill,
+    type RegistrationResponseJSON,
+    type AuthenticationResponseJSON
+} from '@simplewebauthn/browser';
 import { passkeyApi, Authenticator } from '../api/passkey';
 import { useToast } from './useToast';
 import { useAuth } from './useAuth';
 import { CredentialIdModal } from '../components/ui/CredentialIdModal';
 import { DebugInfoModal } from '../components/DebugInfoModal';
+import { formatAuthenticationResponse, normalizeCredentialId } from '../utils/credentialUtils';
+import { SimpleUser } from '../types/auth';
 
 interface UsePasskeyReturn {
     credentials: Authenticator[];
     isLoading: boolean;
+    isSupported: boolean;
+    hasAutofillSupport: boolean;
     loadCredentials: () => Promise<void>;
     registerAuthenticator: (name: string) => Promise<void>;
     removeAuthenticator: (id: string) => Promise<void>;
@@ -27,424 +38,293 @@ export const usePasskey = (): UsePasskeyReturn & {
 } => {
     const [credentials, setCredentials] = useState<Authenticator[]>([]);
     const [isLoading, setIsLoading] = useState(false);
+    const [isSupported, setIsSupported] = useState(false);
+    const [hasAutofillSupport, setHasAutofillSupport] = useState(false);
     const { showToast } = useToast();
     const { loginWithToken } = useAuth();
 
-    // 新增弹窗状态
+    // 弹窗状态
     const [showModal, setShowModal] = useState(false);
     const [currentCredentialId, setCurrentCredentialId] = useState('');
     const [showDebugModal, setShowDebugModal] = useState(false);
     const [debugInfos, setDebugInfos] = useState<any[]>([]);
 
-    // 添加调试信息的函数
-    const addDebugInfo = useCallback((info: any) => {
-        setDebugInfos(prev => [...prev, info]);
+    // 检查浏览器支持
+    useEffect(() => {
+        const checkSupport = async () => {
+            const webauthnSupport = browserSupportsWebAuthn();
+            const autofillSupport = await browserSupportsWebAuthnAutofill();
+            setIsSupported(webauthnSupport);
+            setHasAutofillSupport(autofillSupport);
+            
+            addDebugInfo({
+                action: '检查浏览器支持',
+                webauthnSupport,
+                autofillSupport,
+                userAgent: navigator.userAgent,
+                timestamp: new Date().toISOString()
+            });
+        };
+        checkSupport();
     }, []);
 
+    // 添加调试信息
+    const addDebugInfo = useCallback((info: any) => {
+        setDebugInfos(prev => [...prev, {
+            ...info,
+            timestamp: info.timestamp || new Date().toISOString()
+        }]);
+    }, []);
+
+    // 加载凭证列表
     const loadCredentials = useCallback(async () => {
+        if (!isSupported) {
+            showToast('您的浏览器不支持 Passkey', 'error');
+            return;
+        }
+
         try {
             setIsLoading(true);
             const response = await passkeyApi.getCredentials();
             setCredentials(response.data);
+            
+            addDebugInfo({
+                action: '加载凭证列表',
+                credentialsCount: response.data.length,
+                timestamp: new Date().toISOString()
+            });
         } catch (error) {
             if (error instanceof Error && error.message === 'Unauthorized') {
                 showToast('登录已过期，请重新登录', 'error');
             } else {
                 showToast('加载 Passkey 凭证失败', 'error');
             }
+            
+            addDebugInfo({
+                action: '加载凭证失败',
+                error: error instanceof Error ? error.message : String(error),
+                timestamp: new Date().toISOString()
+            });
         } finally {
             setIsLoading(false);
         }
-    }, [showToast]);
+    }, [isSupported, showToast, addDebugInfo]);
 
+    // 注册新的认证器
     const registerAuthenticator = useCallback(async (credentialName: string) => {
+        if (!isSupported) {
+            showToast('您的浏览器不支持 Passkey', 'error');
+            return;
+        }
+
         setIsLoading(true);
-        let attResp: any = null;
+        
         try {
             // 获取注册选项
             const optionsResponse = await passkeyApi.startRegistration(credentialName);
-            if (!optionsResponse.data || !optionsResponse.data.options) {
-                showToast('注册 Passkey 失败: 后端未返回注册选项（options）', 'error');
-                return;
+            if (!optionsResponse.data?.options) {
+                throw new Error('注册失败: 服务器未返回有效的注册选项');
             }
-            // 调用浏览器的 Passkey API
+
+            addDebugInfo({
+                action: '开始注册',
+                credentialName,
+                hasOptions: true,
+                rpId: optionsResponse.data.options.rp?.id,
+                timeout: optionsResponse.data.options.timeout,
+                timestamp: new Date().toISOString()
+            });
+
             try {
-                attResp = await startRegistration({ optionsJSON: optionsResponse.data.options });
-            } catch (error: any) {
-                if (attResp && attResp.id) {
+                // 调用浏览器API进行注册
+                const attResp = await startRegistration({ 
+                    optionsJSON: optionsResponse.data.options,
+                });
+
+                // 标准化 credentialId
+                if (attResp.id) {
                     setCurrentCredentialId(attResp.id);
                     setShowModal(true);
-                    // 记录注册异常但弹窗 credentialID（不输出到控制台）
-                    const registerErrorInfo = {
-                        action: '注册异常但弹窗 credentialID',
-                        credentialID: attResp.id,
+                    addDebugInfo({
+                        action: '注册成功',
+                        credentialId: attResp.id,
+                        type: attResp.type,
                         timestamp: new Date().toISOString()
-                    };
+                    });
                 }
+
+                // 完成注册
+                const verificationResponse = await passkeyApi.finishRegistration(credentialName, attResp);
+                
+                if (!verificationResponse.success) {
+                    throw new Error('服务器验证失败: ' + verificationResponse.error);
+                }
+
+                showToast('Passkey 注册成功', 'success');
+                await loadCredentials();
+                
+            } catch (error: any) {
                 if (error?.name === 'NotAllowedError') {
-                    showToast('用户取消了操作', 'error');
+                    throw new Error('用户取消了操作');
+                } else if (error?.name === 'InvalidStateError') {
+                    throw new Error('该认证器可能已经注册过了');
                 } else {
-                    showToast('注册 Passkey 失败: ' + (error?.message || '未知错误'), 'error');
+                    throw error;
                 }
-                return;
             }
-            // 完成注册
-            await passkeyApi.finishRegistration(credentialName, attResp);
-            // 注册成功后弹窗显示 credentialID
-            if (attResp && attResp.id) {
-                setCurrentCredentialId(attResp.id);
-                setShowModal(true);
-                // 记录注册成功弹窗 credentialID（不输出到控制台）
-                const registerSuccessInfo = {
-                    action: '注册成功弹窗 credentialID',
-                    credentialID: attResp.id,
-                    timestamp: new Date().toISOString()
-                };
-            }
-            showToast('Passkey 注册成功', 'success');
-            await loadCredentials();
+            
         } catch (error: any) {
-            if (attResp && attResp.id) {
-                setCurrentCredentialId(attResp.id);
-                setShowModal(true);
-                // 记录注册异常弹窗 credentialID（不输出到控制台）
-                const registerExceptionInfo = {
-                    action: '注册异常弹窗 credentialID',
-                    credentialID: attResp.id,
-                    timestamp: new Date().toISOString()
-                };
+            let errorMessage = '注册 Passkey 失败';
+            if (error?.message) {
+                errorMessage = error.message;
             }
-            let msg = '注册 Passkey 失败';
-            if (error?.response?.data?.error) {
-                msg += ': ' + error.response.data.error;
-            } else if (error?.message) {
-                msg += ': ' + error.message;
-            } else if (error?.name === 'NotAllowedError') {
-                msg = '用户取消了操作';
-            }
-            showToast(msg, 'error');
+            
+            addDebugInfo({
+                action: '注册失败',
+                error: errorMessage,
+                errorDetails: error instanceof Error ? error.stack : String(error),
+                timestamp: new Date().toISOString()
+            });
+            
+            showToast(errorMessage, 'error');
         } finally {
             setIsLoading(false);
         }
-    }, [loadCredentials, showToast]);
+    }, [isSupported, loadCredentials, showToast, addDebugInfo]);
 
+    // 认证
     const authenticateWithPasskey = useCallback(async (username: string): Promise<boolean> => {
-        let asseResp: any = null;
+        if (!isSupported) {
+            showToast('您的浏览器不支持 Passkey', 'error');
+            return false;
+        }
+
         try {
             setIsLoading(true);
             
-            // 记录传入的用户名
             addDebugInfo({
                 action: '开始Passkey认证',
-                username: username,
+                username,
                 timestamp: new Date().toISOString()
             });
             
             // 获取认证选项
             const optionsResponse = await passkeyApi.startAuthentication(username);
-            
-            // 记录API响应信息
-            addDebugInfo({
-                action: 'Passkey认证API响应',
-                status: optionsResponse.status,
-                hasData: !!optionsResponse.data,
-                dataKeys: Object.keys(optionsResponse.data || {}),
-                hasOptions: !!optionsResponse.data?.options,
-                optionsKeys: optionsResponse.data?.options ? Object.keys(optionsResponse.data.options) : [],
-                timestamp: new Date().toISOString()
-            });
-            
-            // 记录认证选项信息
+            if (!optionsResponse.data?.options) {
+                throw new Error('认证选项获取失败：服务器未返回有效选项');
+            }
+
+            const options = optionsResponse.data.options;
             addDebugInfo({
                 action: 'Passkey认证选项',
-                hasOptions: !!optionsResponse.data.options,
-                optionsKeys: optionsResponse.data.options ? Object.keys(optionsResponse.data.options) : [],
-                allowCredentials: optionsResponse.data.options?.allowCredentials?.length || 0,
-                challenge: optionsResponse.data.options?.challenge?.substring(0, 20) + '...',
-                allowCredentialsDetails: optionsResponse.data.options?.allowCredentials?.map((cred: any) => ({
-                    id: cred.id?.substring(0, 20) + '...',
-                    type: cred.type,
-                    transports: cred.transports,
-                    fullId: cred.id
-                })),
+                rpId: options.rpId,
+                timeout: options.timeout,
+                userVerification: options.userVerification,
+                allowCredentials: options.allowCredentials?.length || 0,
                 timestamp: new Date().toISOString()
             });
+
+            // 调用浏览器API进行认证
+            const authResp = await startAuthentication({ 
+                optionsJSON: options,
+                useBrowserAutofill: hasAutofillSupport // 根据浏览器支持情况启用自动填充
+            });
             
-            // 调用浏览器的 Passkey API
-            try {
-                // 确保认证选项格式正确
-                const options = optionsResponse.data.options;
-                addDebugInfo({
-                    action: '准备调用startAuthentication',
-                    hasOptions: !!options,
-                    optionsType: typeof options,
-                    optionsKeys: Object.keys(options || {}),
-                    allowCredentialsCount: options?.allowCredentials?.length || 0,
-                    timestamp: new Date().toISOString()
-                });
-                
-                asseResp = await startAuthentication({ optionsJSON: options });
-                
-                                            // 记录响应对象结构
-                addDebugInfo({
-                    action: 'Passkey认证响应对象',
-                    hasId: !!asseResp.id,
-                    hasRawId: !!asseResp.rawId,
-                    hasResponse: !!asseResp.response,
-                    type: asseResp.type,
-                    idLength: asseResp.id?.length,
-                    rawIdType: typeof asseResp.rawId,
-                    rawIdByteLength: asseResp.rawId?.byteLength,
-                    responseKeys: asseResp.response ? Object.keys(asseResp.response) : [],
-                    idValue: asseResp.id?.substring(0, 20) + '...',
-                    rawIdArray: asseResp.rawId ? Array.from(new Uint8Array(asseResp.rawId)).slice(0, 10) : null,
-                    timestamp: new Date().toISOString()
-                });
-                
-                // 确保响应对象包含必要的字段
-                if (!asseResp.id && !asseResp.rawId) {
-                    throw new Error('Passkey认证响应缺少credentialID字段');
-                }
-                
-                // 如果只有rawId没有id，手动添加id字段
-                if (asseResp.rawId && !asseResp.id) {
-                    try {
-                        // 将ArrayBuffer转换为base64url字符串
-                        const uint8Array = new Uint8Array(asseResp.rawId);
-                        const base64String = btoa(String.fromCharCode(...uint8Array));
-                        // 转换为base64url格式（替换+为-，/为_，移除=）
-                        asseResp.id = base64String.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-                        // 记录手动添加id字段
-                        addDebugInfo({
-                            action: '手动添加id字段',
-                            idValue: asseResp.id.substring(0, 20) + '...',
-                            timestamp: new Date().toISOString()
-                        });
-                    } catch (error) {
-                        // 记录转换失败
-                        addDebugInfo({
-                            action: '转换rawId失败',
-                            error: error instanceof Error ? error.message : String(error),
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                } else if (asseResp.id) {
-                    // 如果已有id字段，确保它是base64url格式
-                    if (asseResp.id.includes('+') || asseResp.id.includes('/') || asseResp.id.includes('=')) {
-                        asseResp.id = asseResp.id.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-                        addDebugInfo({
-                            action: '修复现有id字段格式',
-                            originalId: asseResp.id,
-                            fixedId: asseResp.id.substring(0, 20) + '...',
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                }
-                
-            } catch (error) {
-                // 记录startAuthentication调用失败
-                addDebugInfo({
-                    action: 'startAuthentication调用失败',
-                    error: error instanceof Error ? error.message : String(error),
-                    timestamp: new Date().toISOString()
-                });
-                throw error;
-            }
-        } catch (error: any) {
-            // 即使失败也尝试弹窗
-            if (asseResp && asseResp.id) {
-                setCurrentCredentialId(asseResp.id);
+            if (authResp.id) {
+                setCurrentCredentialId(authResp.id);
                 setShowModal(true);
-                // 记录认证异常但弹窗 credentialID
                 addDebugInfo({
-                    action: '认证异常但弹窗 credentialID',
-                    credentialID: asseResp.id,
+                    action: '认证响应',
+                    credentialId: authResp.id,
+                    type: authResp.type,
                     timestamp: new Date().toISOString()
                 });
             }
-            if (error?.name === 'NotAllowedError') {
-                showToast('用户取消了操作', 'error');
-            } else if (error?.response?.data?.error) {
-                showToast('Passkey 认证失败: ' + error.response.data.error, 'error');
-            } else if (error?.message) {
-                showToast('Passkey 认证失败: ' + error.message, 'error');
-            } else {
-                showToast('Passkey 认证失败', 'error');
+
+            // 完成认证
+            const verificationResponse = await passkeyApi.finishAuthentication(username, authResp);
+            if (!verificationResponse.success) {
+                throw new Error('认证验证失败：' + verificationResponse.error);
             }
-            setIsLoading(false);
-            return false;
-        }
-        // 只要有 id 就弹窗
-        if (asseResp && asseResp.id) {
-            setCurrentCredentialId(asseResp.id);
-            setShowModal(true);
-            // 记录认证弹窗 credentialID
-            addDebugInfo({
-                action: '认证弹窗 credentialID',
-                credentialID: asseResp.id,
-                timestamp: new Date().toISOString()
-            });
-        }
-        try {
-            // 完成认证 - 确保传递完整的响应对象
-            addDebugInfo({
-                action: '发送认证响应到后端',
-                username,
-                responseKeys: Object.keys(asseResp),
-                hasId: !!asseResp.id,
-                hasRawId: !!asseResp.rawId,
-                hasResponse: !!asseResp.response,
-                idValue: asseResp.id?.substring(0, 20) + '...',
-                responseType: asseResp.type,
-                timestamp: new Date().toISOString()
-            });
-            
-            // 确保响应对象包含所有必要字段，并正确处理ArrayBuffer
-            const responseToSend = {
-                id: asseResp.id,
-                type: asseResp.type,
-                response: {
-                    authenticatorData: asseResp.response?.authenticatorData,
-                    clientDataJSON: asseResp.response?.clientDataJSON,
-                    signature: asseResp.response?.signature,
-                    userHandle: asseResp.response?.userHandle
-                },
-                // 确保rawId是正确的base64url格式
-                rawId: asseResp.rawId ? (() => {
-                    try {
-                        const uint8Array = new Uint8Array(asseResp.rawId);
-                        const base64String = btoa(String.fromCharCode(...uint8Array));
-                        // 转换为base64url格式（替换+为-，/为_，移除=）
-                        return base64String.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-                    } catch (error) {
-                        addDebugInfo({
-                            action: 'rawId转换失败',
-                            error: error instanceof Error ? error.message : String(error),
-                            timestamp: new Date().toISOString()
-                        });
-                        return undefined;
-                    }
-                })() : undefined
+
+            // 使用 SimpleUser 类型
+            const userData: SimpleUser = {
+                id: verificationResponse.data.user.id,
+                username: verificationResponse.data.user.username
             };
-            
-            // 确保id字段也是正确的base64url格式
-            if (responseToSend.id) {
-                // 检查id是否包含base64标准字符，需要转换为base64url
-                if (responseToSend.id.includes('+') || responseToSend.id.includes('/') || responseToSend.id.includes('=')) {
-                    try {
-                        // 如果id包含base64标准字符，转换为base64url格式
-                        responseToSend.id = responseToSend.id.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-                        
-                        addDebugInfo({
-                            action: '修复id字段格式',
-                            originalId: asseResp.id,
-                            fixedId: responseToSend.id.substring(0, 20) + '...',
-                            timestamp: new Date().toISOString()
-                        });
-                    } catch (error) {
-                        addDebugInfo({
-                            action: 'id字段格式修复失败',
-                            error: error instanceof Error ? error.message : String(error),
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                }
-                
-                // 额外检查：确保id是有效的base64url格式
-                if (!responseToSend.id.match(/^[A-Za-z0-9_-]+$/)) {
-                    addDebugInfo({
-                        action: 'id字段格式无效',
-                        id: responseToSend.id,
-                        timestamp: new Date().toISOString()
-                    });
-                } else {
-                    addDebugInfo({
-                        action: 'id字段格式验证通过',
-                        id: responseToSend.id.substring(0, 20) + '...',
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                
-                // 确保id是纯base64url格式（移除所有填充字符）
-                responseToSend.id = responseToSend.id.replace(/=/g, '');
-                addDebugInfo({
-                    action: '移除填充字符',
-                    originalLength: responseToSend.id.length + (responseToSend.id.match(/=/g) || []).length,
-                    finalLength: responseToSend.id.length,
-                    timestamp: new Date().toISOString()
-                });
-            }
-            
-            // 记录credentialID的详细信息
-            addDebugInfo({
-                action: 'credentialID详细信息',
-                originalId: asseResp.id,
-                finalId: responseToSend.id,
-                rawIdExists: !!asseResp.rawId,
-                rawIdLength: asseResp.rawId?.byteLength,
-                timestamp: new Date().toISOString()
-            });
-            
-            addDebugInfo({
-                action: '最终发送的响应对象',
-                hasId: !!responseToSend.id,
-                idValue: responseToSend.id?.substring(0, 20) + '...',
-                responseKeys: Object.keys(responseToSend),
-                timestamp: new Date().toISOString()
-            });
-            
-            const response = await passkeyApi.finishAuthentication(username, responseToSend);
-            // 使用返回的令牌登录
-            await loginWithToken(response.data.token, response.data.user);
+
+            // 登录成功处理
+            await loginWithToken(verificationResponse.data.token, userData);
             showToast('Passkey 认证成功', 'success');
-            return response.data.success || false;
+            return true;
+            
         } catch (error: any) {
-            if (asseResp && asseResp.id) {
-                setCurrentCredentialId(asseResp.id);
-                setShowModal(true);
-                // 记录认证异常弹窗 credentialID
-                addDebugInfo({
-                    action: '认证异常弹窗 credentialID',
-                    credentialID: asseResp.id,
-                    timestamp: new Date().toISOString()
-                });
-            }
+            let errorMessage = '认证失败';
+            
             if (error?.name === 'NotAllowedError') {
-                showToast('用户取消了操作', 'error');
-            } else if (error?.response?.data?.error) {
-                showToast('Passkey 认证失败: ' + error.response.data.error, 'error');
+                errorMessage = '用户取消了操作';
+            } else if (error?.name === 'SecurityError') {
+                errorMessage = '认证器可能不受此源信任';
             } else if (error?.message) {
-                showToast('Passkey 认证失败: ' + error.message, 'error');
-            } else {
-                showToast('Passkey 认证失败', 'error');
+                errorMessage = error.message;
             }
+            
+            addDebugInfo({
+                action: '认证失败',
+                error: errorMessage,
+                errorDetails: error instanceof Error ? error.stack : String(error),
+                timestamp: new Date().toISOString()
+            });
+            
+            showToast(errorMessage, 'error');
             return false;
         } finally {
             setIsLoading(false);
         }
-    }, [loginWithToken, showToast]);
+    }, [isSupported, hasAutofillSupport, loginWithToken, showToast, addDebugInfo]);
 
+    // 删除认证器
     const removeAuthenticator = useCallback(async (credentialId: string) => {
+        if (!isSupported) {
+            showToast('您的浏览器不支持 Passkey', 'error');
+            return;
+        }
+
         try {
             setIsLoading(true);
             await passkeyApi.removeCredential(credentialId);
             showToast('Passkey 凭证已删除', 'success');
             await loadCredentials();
+            
+            addDebugInfo({
+                action: '删除凭证',
+                credentialId,
+                success: true,
+                timestamp: new Date().toISOString()
+            });
         } catch (error) {
             if (error instanceof Error && error.message === 'Unauthorized') {
                 showToast('登录已过期，请重新登录', 'error');
             } else {
                 showToast('删除 Passkey 凭证失败', 'error');
             }
+            
+            addDebugInfo({
+                action: '删除凭证失败',
+                credentialId,
+                error: error instanceof Error ? error.message : String(error),
+                timestamp: new Date().toISOString()
+            });
         } finally {
             setIsLoading(false);
         }
-    }, [loadCredentials, showToast]);
+    }, [isSupported, loadCredentials, showToast, addDebugInfo]);
 
-    // 返回时导出弹窗组件
     return {
         credentials,
         isLoading,
+        isSupported,
+        hasAutofillSupport,
         loadCredentials,
         registerAuthenticator,
         removeAuthenticator,

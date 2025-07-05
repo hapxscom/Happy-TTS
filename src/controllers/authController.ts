@@ -4,6 +4,7 @@ import logger from '../utils/logger';
 import { config } from '../config/config';
 import fs from 'fs';
 import path from 'path';
+import { isValidCredentialId } from '../utils/credentialUtils';
 
 export class AuthController {
     private static isLocalIp(ip: string): boolean {
@@ -116,7 +117,12 @@ export class AuthController {
             // 检查用户是否启用了TOTP或Passkey
             const hasTOTP = !!user.totpEnabled;
             const hasPasskey = Array.isArray(user.passkeyCredentials) && user.passkeyCredentials.length > 0;
-            if (hasTOTP || hasPasskey) {
+            const hasValidPasskey = hasPasskey && user.passkeyCredentials!.some(cred => 
+                cred && typeof cred.credentialID === 'string' && 
+                isValidCredentialId(cred.credentialID)
+            );
+            
+            if (hasTOTP || hasValidPasskey) {
                 // 兜底：只返回临时token和二次验证类型，禁止直接登录
                 // 必须通过TOTP或Passkey二次验证接口后，才发放正式token
                 const tempToken = user.id;
@@ -126,7 +132,7 @@ export class AuthController {
                     user: userWithoutPassword,
                     token: tempToken,
                     requires2FA: true,
-                    twoFactorType: [hasTOTP ? 'TOTP' : null, hasPasskey ? 'Passkey' : null].filter(Boolean)
+                    twoFactorType: [hasTOTP ? 'TOTP' : null, hasValidPasskey ? 'Passkey' : null].filter(Boolean)
                 });
             }
 

@@ -2,7 +2,7 @@ export interface User {
   id: string;
   username: string;
   email: string;
-  role: string;
+  role: 'user' | 'admin';
   dailyUsage: number;
   lastUsageDate: string;
   createdAt: string;
@@ -13,6 +13,13 @@ export interface User {
   token?: string;
   tokenExpiresAt?: number;
 }
+
+export interface SimpleUser {
+  id: string;
+  username: string;
+}
+
+export type UserRole = 'user' | 'admin';
 
 export interface TOTPStatus {
   enabled: boolean;

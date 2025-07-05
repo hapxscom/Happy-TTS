@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { User } from '../types/auth';
+import { User, SimpleUser } from '../types/auth';
 
 // 获取API基础URL
 const getApiBaseUrl = () => {
@@ -184,9 +184,9 @@ export const useAuth = () => {
     };
 
     // 新增：使用 token 和用户信息直接登录（用于 Passkey 认证）
-    const loginWithToken = async (token: string, user: User) => {
+    const loginWithToken = async (token: string, user: User | SimpleUser) => {
         localStorage.setItem('token', token);
-        setUser(user);
+        setUser(user as User); // 类型断言，因为后续会通过 checkAuth 获取完整的用户信息
         lastCheckRef.current = Date.now();
         setLastCheckTime(Date.now());
         window.location.reload();

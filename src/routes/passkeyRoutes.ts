@@ -6,6 +6,7 @@ import { authenticateToken } from '../middleware/authenticateToken';
 import { UserStorage, User } from '../utils/userStorage';
 import logger from '../utils/logger';
 import { rateLimitMiddleware } from '../middleware/rateLimit';
+import { normalizeCredentialId, isValidCredentialId, formatAuthenticationResponse } from '../utils/credentialUtils';
 
 const router = express.Router();
 
@@ -60,15 +61,30 @@ router.post('/register/start', authenticateToken, rateLimitMiddleware, async (re
             logger.error('[Passkey] generateRegistrationOptions error', { userId, credentialName, err });
             return res.status(500).json({ error: '生成注册选项失败', details: err instanceof Error ? err.message : String(err) });
         }
-        logger.info('[Passkey] /register/start options', { userId, options });
+
         if (!options) {
             logger.error('[Passkey] options 为 undefined', { userId, credentialName });
             return res.status(500).json({ error: '生成注册选项失败', details: { userId, credentialName, options } });
         }
+
         if (!options.challenge) {
             logger.error('[Passkey] options.challenge 为 undefined', { userId, credentialName, options });
-            return res.status(500).json({ error: '生成注册选项失败', details: { userId, credentialName, options } });
+            return res.status(500).json({ error: '生成注册选项失败: 缺少 challenge', details: { userId, credentialName, options } });
         }
+
+        if (!options.user?.id) {
+            logger.error('[Passkey] options.user.id 为 undefined', { userId, credentialName, options });
+            return res.status(500).json({ error: '生成注册选项失败: 缺少用户ID', details: { userId, credentialName, options } });
+        }
+
+        logger.info('[Passkey] 生成的注册选项', {
+            userId,
+            challenge: options.challenge.substring(0, 20) + '...',
+            rpId: options.rp?.id,
+            userVerification: options.authenticatorSelection?.userVerification,
+            attestationType: options.attestation,
+            excludeCredentialsCount: options.excludeCredentials?.length || 0
+        });
 
         await UserStorage.updateUser(userId, {
             pendingChallenge: options.challenge
@@ -175,18 +191,18 @@ router.post('/authenticate/finish', rateLimitMiddleware, async (req, res) => {
             return res.status(400).json({ error: '用户名和响应是必需的' });
         }
         
+        // 格式化响应对象
+        const formattedResponse = formatAuthenticationResponse(response);
+        
         // 调试日志：记录接收到的响应对象
         logger.info('[Passkey] /authenticate/finish 收到请求', {
             username,
-            responseKeys: Object.keys(response),
-            hasId: !!response.id,
-            hasRawId: !!response.rawId,
-            hasResponse: !!response.response,
-            type: response.type,
-            idLength: response.id?.length,
-            rawIdType: typeof response.rawId,
-            idValue: response.id?.substring(0, 20) + '...',
-            fullResponse: JSON.stringify(response, null, 2)
+            responseKeys: Object.keys(formattedResponse),
+            hasId: !!formattedResponse.id,
+            type: formattedResponse.type,
+            idLength: formattedResponse.id?.length,
+            idValue: formattedResponse.id?.substring(0, 20) + '...',
+            fullResponse: JSON.stringify(formattedResponse, null, 2)
         });
         
         const user = await UserStorage.getUserByUsername(username);
@@ -195,7 +211,7 @@ router.post('/authenticate/finish', rateLimitMiddleware, async (req, res) => {
         }
         // 自动获取请求origin
         const requestOrigin = req.headers.origin || req.headers.referer || 'http://localhost:3001';
-        const verification = await PasskeyService.verifyAuthentication(user, response, requestOrigin);
+        const verification = await PasskeyService.verifyAuthentication(user, formattedResponse, requestOrigin);
         const token = await PasskeyService.generateToken(user);
         res.json({
             success: true,
@@ -219,7 +235,13 @@ router.delete('/credentials/:credentialId', authenticateToken, rateLimitMiddlewa
             return res.status(400).json({ error: '凭证ID是必需的' });
         }
 
-        await PasskeyService.removeCredential(userId, credentialId);
+        // 标准化 credentialId 格式
+        const normalizedCredentialId = normalizeCredentialId(credentialId);
+        if (!normalizedCredentialId || !isValidCredentialId(normalizedCredentialId)) {
+            return res.status(400).json({ error: '无效的凭证ID格式' });
+        }
+
+        await PasskeyService.removeCredential(userId, normalizedCredentialId);
         res.json({ success: true });
     } catch (error) {
         console.error('删除 Passkey 凭证失败:', error);
@@ -386,11 +408,16 @@ router.get('/credential-id/check', authenticateToken, async (req, res) => {
         const credentialInfo = user.passkeyCredentials.map((cred, index) => ({
             index,
             credentialId: cred.credentialID,
+            name: cred.name,
+            isPasskey: (cred as any).isPasskey || false,
+            credentialDeviceType: (cred as any).credentialDeviceType,
+            credentialBackedUp: (cred as any).credentialBackedUp,
             ...PasskeyCredentialIdFixer.getCredentialIdInfo(cred.credentialID)
         }));
         
         const validCredentials = credentialInfo.filter(info => info.isValid);
         const invalidCredentials = credentialInfo.filter(info => !info.isValid);
+        const passkeyCredentials = credentialInfo.filter(info => info.isPasskey);
         
         res.json({
             success: true,
@@ -398,6 +425,7 @@ router.get('/credential-id/check', authenticateToken, async (req, res) => {
             totalCredentials: user.passkeyCredentials.length,
             validCredentials: validCredentials.length,
             invalidCredentials: invalidCredentials.length,
+            passkeyCredentials: passkeyCredentials.length,
             needsFix: invalidCredentials.length > 0,
             credentialDetails: credentialInfo
         });
@@ -407,6 +435,56 @@ router.get('/credential-id/check', authenticateToken, async (req, res) => {
             error: error instanceof Error ? error.message : String(error) 
         });
         res.status(500).json({ error: '检查credentialID状态失败' });
+    }
+});
+
+// 获取当前用户的Passkey统计信息（需要认证）
+router.get('/stats', authenticateToken, async (req, res) => {
+    try {
+        const userId = (req as any).user.id;
+        const user = await UserStorage.getUserById(userId);
+        
+        if (!user) {
+            return res.status(404).json({ error: '用户不存在' });
+        }
+        
+        if (!user.passkeyEnabled || !user.passkeyCredentials || user.passkeyCredentials.length === 0) {
+            return res.json({
+                success: true,
+                hasPasskey: false,
+                stats: {
+                    totalCredentials: 0,
+                    passkeyCredentials: 0,
+                    hardwareCredentials: 0,
+                    validCredentials: 0,
+                    invalidCredentials: 0
+                }
+            });
+        }
+        
+        const stats = {
+            totalCredentials: user.passkeyCredentials.length,
+            passkeyCredentials: user.passkeyCredentials.filter(cred => (cred as any).isPasskey).length,
+            hardwareCredentials: user.passkeyCredentials.filter(cred => !(cred as any).isPasskey).length,
+            validCredentials: user.passkeyCredentials.filter(cred => 
+                isValidCredentialId(cred.credentialID)
+            ).length,
+            invalidCredentials: user.passkeyCredentials.filter(cred => 
+                !isValidCredentialId(cred.credentialID)
+            ).length
+        };
+        
+        res.json({
+            success: true,
+            hasPasskey: true,
+            stats
+        });
+    } catch (error) {
+        logger.error('[Passkey] 获取用户Passkey统计信息失败', { 
+            userId: (req as any).user.id,
+            error: error instanceof Error ? error.message : String(error) 
+        });
+        res.status(500).json({ error: '获取Passkey统计信息失败' });
     }
 });
 

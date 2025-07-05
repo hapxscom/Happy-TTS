@@ -1,5 +1,6 @@
 import { UserStorage, User } from './userStorage';
 import logger from './logger';
+import { normalizeCredentialId, isValidCredentialId } from './credentialUtils';
 
 /**
  * Passkey CredentialID 修复工具
@@ -55,7 +56,20 @@ export class PasskeyCredentialIdFixer {
                 }
 
                 const originalCredentialId = cred.credentialID;
-                const fixedCredentialId = this.fixCredentialId(originalCredentialId);
+                const fixedCredentialId = normalizeCredentialId(originalCredentialId);
+
+                // 二次检验修复后的credentialID
+                if (!fixedCredentialId || !isValidCredentialId(fixedCredentialId)) {
+                    logger.warn('[CredentialID修复] 修复后的credentialID验证失败，剔除', {
+                        userId: user.id,
+                        index: i,
+                        original: originalCredentialId?.substring(0, 10) + '...',
+                        fixed: fixedCredentialId?.substring(0, 10) + '...'
+                    });
+                    user.passkeyCredentials[i] = null as any;
+                    hasChanges = true;
+                    continue;
+                }
 
                 if (fixedCredentialId !== originalCredentialId) {
                     cred.credentialID = fixedCredentialId;
@@ -77,7 +91,8 @@ export class PasskeyCredentialIdFixer {
                 c && 
                 typeof c === 'object' && 
                 typeof c.credentialID === 'string' && 
-                c.credentialID.length > 0
+                c.credentialID.length > 0 &&
+                isValidCredentialId(c.credentialID)
             );
             const afterFilter = user.passkeyCredentials.length;
 
@@ -175,54 +190,6 @@ export class PasskeyCredentialIdFixer {
     }
 
     /**
-     * 修复单个credentialID
-     */
-    private static fixCredentialId(credentialId: any): string {
-        if (!credentialId) {
-            throw new Error('credentialID为空');
-        }
-
-        // 如果已经是正确的base64url格式，直接返回
-        if (typeof credentialId === 'string' && /^[A-Za-z0-9_-]+$/.test(credentialId)) {
-            return credentialId;
-        }
-
-        // 尝试转换为base64url格式
-        try {
-            if (Buffer.isBuffer(credentialId)) {
-                return credentialId.toString('base64url');
-            }
-            
-            if (typeof credentialId === 'string') {
-                // 尝试从base64解码再重新编码为base64url
-                try {
-                    const buffer = Buffer.from(credentialId, 'base64');
-                    return buffer.toString('base64url');
-                } catch {
-                    // 如果解码失败，直接转换为base64url
-                    return Buffer.from(credentialId).toString('base64url');
-                }
-            }
-            
-            // 其他类型，强制转换为字符串再转base64url
-            return Buffer.from(String(credentialId)).toString('base64url');
-            
-        } catch (error) {
-            throw new Error(`无法修复credentialID: ${credentialId} - ${error instanceof Error ? error.message : String(error)}`);
-        }
-    }
-
-    /**
-     * 检查credentialID是否有效
-     */
-    public static isValidCredentialId(credentialId: any): boolean {
-        return credentialId && 
-               typeof credentialId === 'string' && 
-               /^[A-Za-z0-9_-]+$/.test(credentialId) && 
-               credentialId.length > 0;
-    }
-
-    /**
      * 获取credentialID的详细信息
      */
     public static getCredentialIdInfo(credentialId: any): {
@@ -233,34 +200,45 @@ export class PasskeyCredentialIdFixer {
         issues: string[];
     } {
         const issues: string[] = [];
-        let isValid = false;
-        let format = 'unknown';
+        let format = '未知';
+        let type = typeof credentialId;
 
         if (!credentialId) {
             issues.push('credentialID为空');
-        } else if (typeof credentialId !== 'string') {
-            issues.push(`credentialID类型错误: ${typeof credentialId}`);
-        } else if (credentialId.length === 0) {
-            issues.push('credentialID长度为0');
-        } else if (!/^[A-Za-z0-9_-]+$/.test(credentialId)) {
-            issues.push('credentialID格式不是有效的base64url');
-            // 尝试检测格式
-            if (/^[A-Za-z0-9+/]+=*$/.test(credentialId)) {
-                format = 'base64';
-            } else if (/^[A-Za-z0-9_-]+$/.test(credentialId)) {
-                format = 'base64url';
-            } else {
-                format = 'unknown';
-            }
-        } else {
-            isValid = true;
-            format = 'base64url';
+            return {
+                isValid: false,
+                type,
+                length: 0,
+                format,
+                issues
+            };
+        }
+
+        // 检查类型
+        if (Buffer.isBuffer(credentialId)) {
+            type = 'object'; // Buffer 实际上是一个对象
+            format = 'buffer';
+        } else if (typeof credentialId === 'string') {
+            format = /^[A-Za-z0-9_-]+$/.test(credentialId) ? 'base64url' : '其他字符串';
+        }
+
+        // 检查格式
+        if (format !== 'base64url') {
+            issues.push('不是有效的base64url格式');
+        }
+
+        // 检查长度
+        const length = Buffer.isBuffer(credentialId) ? credentialId.length : 
+            typeof credentialId === 'string' ? credentialId.length : 0;
+
+        if (length === 0) {
+            issues.push('长度为0');
         }
 
         return {
-            isValid,
-            type: typeof credentialId,
-            length: credentialId?.length || 0,
+            isValid: issues.length === 0,
+            type,
+            length,
             format,
             issues
         };

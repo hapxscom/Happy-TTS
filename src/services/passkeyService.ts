@@ -12,6 +12,7 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config/config';
 import logger from '../utils/logger';
 import { env } from '../config/env';
+import { normalizeCredentialId, isValidCredentialId, formatAuthenticationResponse } from '../utils/credentialUtils';
 
 // 认证器模型
 interface Authenticator {
@@ -21,6 +22,10 @@ interface Authenticator {
     credentialPublicKey: string;
     counter: number;
     createdAt: string;
+    // Passkey相关字段
+    isPasskey?: boolean;
+    credentialDeviceType?: string;
+    credentialBackedUp?: boolean;
 }
 
 // 获取 RP ID（依赖域名）
@@ -52,7 +57,6 @@ async function fixUserPasskeyCredentialIDs(user: User) {
     }
     
     let changed = false;
-    const validPattern = /^[A-Za-z0-9_-]+$/;
     
     for (let i = 0; i < user.passkeyCredentials.length; i++) {
         const cred = user.passkeyCredentials[i];
@@ -67,95 +71,28 @@ async function fixUserPasskeyCredentialIDs(user: User) {
             continue;
         }
         
-        let original = cred.credentialID;
-        let fixed = null;
-        let reason = '';
+        const original = cred.credentialID;
+        const fixed = normalizeCredentialId(original);
         
-        try {
-            if (typeof original === 'string' && validPattern.test(original)) {
-                continue; // 已合规
-            }
-            
-            if (original == null || original === undefined) {
-                reason = 'credentialID为null/undefined，剔除';
-                user.passkeyCredentials[i] = null as any;
-                changed = true;
-                continue;
-            }
-            
-            // 尝试Buffer转base64url
-            if (Buffer.isBuffer(original)) {
-                fixed = original.toString('base64url');
-            } else if (typeof original === 'string') {
-                // 如果是字符串但不是base64url格式，尝试转换
-                try {
-                    // 先尝试解码，再重新编码为base64url
-                    const buffer = Buffer.from(original, 'base64');
-                    fixed = buffer.toString('base64url');
-                } catch {
-                    // 如果解码失败，直接转换为base64url
-                    fixed = Buffer.from(original).toString('base64url');
-                }
-            } else {
-                // 其他类型，强制转换为字符串再转base64url
-                fixed = Buffer.from(String(original)).toString('base64url');
-            }
-            
-            // 二次检验：确保修复后的credentialID格式正确
-            if (fixed && !fixed.match(/^[A-Za-z0-9_-]+$/)) {
-                logger.warn('[Passkey自愈] 修复后的credentialID仍不是纯base64url格式，尝试强制修复', {
-                    userId: user.id,
-                    original,
-                    fixed,
-                    containsPlus: fixed.includes('+'),
-                    containsSlash: fixed.includes('/'),
-                    containsEquals: fixed.includes('=')
-                });
-                
-                // 强制移除所有非base64url字符
-                fixed = fixed.replace(/[^A-Za-z0-9_-]/g, '');
-                
-                // 如果移除后为空，则剔除
-                if (!fixed || fixed.length === 0) {
-                    reason = '修复后credentialID为空，剔除';
-                    user.passkeyCredentials[i] = null as any;
-                    changed = true;
-                    continue;
-                }
-            }
-            
-            // 最终检验：确保可以正确解码
-            try {
-                const buffer = Buffer.from(fixed, 'base64url');
-                if (buffer.length === 0) {
-                    reason = '修复后credentialID解码为空buffer，剔除';
-                    user.passkeyCredentials[i] = null as any;
-                    changed = true;
-                    continue;
-                }
-            } catch (error) {
-                reason = '修复后credentialID无法解码，剔除';
-                user.passkeyCredentials[i] = null as any;
-                changed = true;
-                continue;
-            }
-            
-            cred.credentialID = fixed;
-            reason = '异常类型，强制转base64url并二次检验通过';
-            changed = true;
-            
-        } catch (e) {
-            reason = 'credentialID彻底无法修复，剔除';
+        if (!fixed) {
+            logger.warn('[Passkey自愈] credentialID无法修复，剔除', {
+                userId: user.id,
+                original
+            });
             user.passkeyCredentials[i] = null as any;
             changed = true;
+            continue;
         }
         
-        logger.warn('[Passkey自愈] credentialID修复', {
-            userId: user.id,
-            original,
-            fixed,
-            reason
-        });
+        if (fixed !== original) {
+            cred.credentialID = fixed;
+            changed = true;
+            logger.info('[Passkey自愈] credentialID已修复', {
+                userId: user.id,
+                original,
+                fixed
+            });
+        }
     }
     
     // 剔除所有无效credential
@@ -164,8 +101,7 @@ async function fixUserPasskeyCredentialIDs(user: User) {
         c && 
         typeof c === 'object' && 
         typeof c.credentialID === 'string' && 
-        validPattern.test(c.credentialID) && 
-        c.credentialID.length > 0
+        isValidCredentialId(c.credentialID)
     );
     const after = user.passkeyCredentials.length;
     
@@ -216,8 +152,9 @@ export class PasskeyService {
                 attestationType: 'none',
                 authenticatorSelection: {
                     authenticatorAttachment: 'platform',
-                    requireResidentKey: true,
-                    userVerification: 'required'
+                    // 使用新的residentKey选项替代requireResidentKey
+                    residentKey: 'required',
+                    userVerification: 'preferred' // 改为preferred以支持无生物识别传感器的设备
                 },
                 excludeCredentials: userAuthenticators.map(authenticator => ({
                     id: authenticator.credentialID,
@@ -249,87 +186,68 @@ export class PasskeyService {
         credentialName: string,
         requestOrigin?: string
     ): Promise<VerifiedRegistrationResponse> {
-        if (!user.pendingChallenge) {
-            throw new Error('注册会话已过期');
-        }
-
-        let verification: VerifiedRegistrationResponse;
+        await fixUserPasskeyCredentialIDs(user);
+        
+        // 格式化响应对象
+        const formattedResponse = formatAuthenticationResponse(response);
+        
         try {
-            verification = await verifyRegistrationResponse({
-                response,
-                expectedChallenge: user.pendingChallenge,
+            const verification = await verifyRegistrationResponse({
+                response: formattedResponse,
+                expectedChallenge: user.pendingChallenge || '',
                 expectedOrigin: requestOrigin || getRpOrigin(),
-                expectedRPID: getRpId()
+                expectedRPID: getRpId(),
+                requireUserVerification: false // 改为 false 以支持无生物识别传感器的设备
             });
-        } catch (error) {
-            logger.error('验证注册响应失败:', error);
-            throw new Error('验证注册响应失败');
-        }
 
-        const { verified, registrationInfo } = verification;
-        if (!verified || !registrationInfo) {
+            const { verified, registrationInfo } = verification;
+
+            if (verified && registrationInfo) {
+                const { credentialPublicKey, credentialID, counter } = registrationInfo as any;
+
+                const normalizedCredentialId = normalizeCredentialId(credentialID);
+                if (!normalizedCredentialId) {
+                    throw new Error('注册失败：无效的 credentialID');
+                }
+
+                const existingCredential = user.passkeyCredentials?.find(
+                    cred => cred.credentialID === normalizedCredentialId
+                );
+
+                if (existingCredential) {
+                    throw new Error('此 Passkey 已注册');
+                }
+
+                const newAuthenticator: Authenticator = {
+                    id: normalizedCredentialId,
+                    name: credentialName,
+                    credentialID: normalizedCredentialId,
+                    credentialPublicKey: credentialPublicKey.toString('base64url'),
+                    counter,
+                    createdAt: new Date().toISOString(),
+                    isPasskey: true,
+                    credentialDeviceType: (registrationInfo as any).credentialDeviceType,
+                    credentialBackedUp: (registrationInfo as any).credentialBackedUp
+                };
+
+                if (!user.passkeyCredentials) {
+                    user.passkeyCredentials = [];
+                }
+
+                user.passkeyCredentials.push(newAuthenticator);
+                await UserStorage.updateUser(user.id, {
+                    passkeyCredentials: user.passkeyCredentials,
+                    pendingChallenge: ''
+                });
+
+                return verification;
+            }
+
             throw new Error('注册验证失败');
-        }
-        console.log('registrationInfo:', registrationInfo);
-        const { credential } = registrationInfo as any;
-        if (!credential || !credential.id || !credential.publicKey) {
-            logger.error('注册信息不完整:', registrationInfo);
-            throw new Error('注册信息不完整，credential.id 或 credential.publicKey 缺失');
-        }
-        // 二次检验：确保注册的credentialID格式正确
-        const credentialID = Buffer.from(credential.id, 'base64url').toString('base64url');
-        
-        logger.info('[Passkey] 注册二次检验：检查credentialID格式', {
-            userId: user.id,
-            originalId: credential.id.substring(0, 10) + '...',
-            convertedId: credentialID.substring(0, 10) + '...',
-            credentialIDLength: credentialID.length
-        });
-        
-        // 检验1：确保转换后的credentialID是纯base64url格式
-        if (!credentialID.match(/^[A-Za-z0-9_-]+$/)) {
-            logger.error('[Passkey] 注册二次检验失败：credentialID不是纯base64url格式', {
-                userId: user.id,
-                credentialID: credentialID,
-                containsPlus: credentialID.includes('+'),
-                containsSlash: credentialID.includes('/'),
-                containsEquals: credentialID.includes('=')
-            });
-            throw new Error('注册失败：Credential ID格式无效');
-        }
-        
-        // 检验2：确保可以正确解码
-        try {
-            const buffer = Buffer.from(credentialID, 'base64url');
-            logger.info('[Passkey] 注册二次检验通过：credentialID可以正确解码', {
-                userId: user.id,
-                bufferLength: buffer.length
-            });
         } catch (error) {
-            logger.error('[Passkey] 注册二次检验失败：credentialID无法解码', {
-                userId: user.id,
-                error: error instanceof Error ? error.message : String(error)
-            });
-            throw new Error('注册失败：Credential ID无法解码');
+            logger.error('[PasskeyService] verifyRegistration 失败:', error);
+            throw error;
         }
-        
-        const newCredential: Authenticator = {
-            id: credential.id,
-            name: credentialName,
-            credentialID: credentialID,
-            credentialPublicKey: Buffer.from(credential.publicKey).toString('base64'),
-            counter: credential.counter,
-            createdAt: new Date().toISOString()
-        };
-
-        // 更新用户记录
-        await UserStorage.updateUser(user.id, {
-            passkeyEnabled: true,
-            passkeyCredentials: [...(user.passkeyCredentials || []), newCredential],
-            pendingChallenge: undefined
-        });
-
-        return verification;
     }
 
     // 生成认证选项
@@ -422,7 +340,7 @@ export class PasskeyService {
             const options = await generateAuthenticationOptions({
                 rpID: getRpId(),
                 allowCredentials,
-                userVerification: 'required'
+                userVerification: 'preferred' // 改为preferred以支持无生物识别传感器的设备
             });
             
             logger.info('[Passkey] generateAuthenticationOptions返回结果:', {
@@ -500,7 +418,7 @@ export class PasskeyService {
                         id: authenticator.credentialID,
                         transports: ['internal']
                     })),
-                    userVerification: 'required'
+                    userVerification: 'preferred' // 改为preferred以支持无生物识别传感器的设备
                 });
                 
                 await UserStorage.updateUser(user.id, {
@@ -528,354 +446,59 @@ export class PasskeyService {
         requestOrigin?: string
     ): Promise<VerifiedAuthenticationResponse> {
         await fixUserPasskeyCredentialIDs(user);
-        if (!user.pendingChallenge) {
-            throw new Error('认证会话已过期');
+        
+        // 格式化响应对象
+        const formattedResponse = formatAuthenticationResponse(response);
+        
+        if (!formattedResponse.id) {
+            throw new Error('认证失败：缺少 credentialID');
         }
 
-        const userAuthenticators = user.passkeyCredentials || [];
-        
-        // 提取credentialID，支持多种格式
-        let responseIdBase64: string;
-        
-        // 详细记录响应对象结构
-        logger.info('[Passkey] 认证响应对象结构', {
-            userId: user.id,
-            responseKeys: Object.keys(response),
-            hasRawId: !!response.rawId,
-            hasId: !!response.id,
-            rawIdType: typeof response.rawId,
-            idType: typeof response.id,
-            responseType: typeof response.response,
-            rawIdIsArray: Array.isArray(response.rawId)
-        });
-        
-        if (response.rawId) {
-            // 处理rawId，可能是ArrayBuffer或数组
-            try {
-                let buffer: Buffer;
-                if (Array.isArray(response.rawId)) {
-                    // 如果是数组，转换为Buffer
-                    buffer = Buffer.from(response.rawId);
-                    logger.info('[Passkey] 从数组rawId转换为Buffer', {
-                        userId: user.id,
-                        arrayLength: response.rawId.length,
-                        bufferLength: buffer.length
-                    });
-                } else if (response.rawId instanceof ArrayBuffer) {
-                    // 如果是ArrayBuffer，直接使用
-                    buffer = Buffer.from(response.rawId);
-                } else {
-                    // 其他情况，尝试转换
-                    buffer = Buffer.from(response.rawId);
-                }
-                
-                responseIdBase64 = isoBase64URL.fromBuffer(buffer);
-                logger.info('[Passkey] 从rawId提取credentialID成功', {
-                    userId: user.id,
-                    rawIdLength: buffer.length,
-                    extractedId: responseIdBase64.substring(0, 10) + '...',
-                    fullId: responseIdBase64
-                });
-            } catch (error) {
-                logger.error('[Passkey] 从rawId提取credentialID失败', {
-                    userId: user.id,
-                    error: error instanceof Error ? error.message : String(error),
-                    rawIdType: typeof response.rawId,
-                    rawIdIsArray: Array.isArray(response.rawId),
-                    rawIdLength: Array.isArray(response.rawId) ? response.rawId.length : response.rawId?.byteLength
-                });
-                throw new Error('从rawId提取credentialID失败: ' + (error instanceof Error ? error.message : String(error)));
-            }
-        } else if (response.id) {
-            // 如果直接有id字段（base64url字符串），直接使用
-            responseIdBase64 = response.id;
-            
-            // 检查id格式，如果不是base64url格式，尝试转换
-            if (!responseIdBase64.match(/^[A-Za-z0-9_-]+$/)) {
-                logger.warn('[Passkey] id字段格式不是base64url，尝试转换', {
-                    userId: user.id,
-                    originalId: responseIdBase64,
-                    idLength: responseIdBase64.length
-                });
-                
-                try {
-                    // 尝试从base64解码再重新编码为base64url
-                    const buffer = Buffer.from(responseIdBase64, 'base64');
-                    responseIdBase64 = buffer.toString('base64url');
-                    logger.info('[Passkey] id字段格式转换成功', {
-                        userId: user.id,
-                        convertedId: responseIdBase64.substring(0, 10) + '...'
-                    });
-                } catch (error) {
-                    logger.error('[Passkey] id字段格式转换失败', {
-                        userId: user.id,
-                        error: error instanceof Error ? error.message : String(error)
-                    });
-                    throw new Error('credentialID格式无效');
-                }
-            }
-            
-            // 确保credentialID是纯base64url格式（移除所有填充字符）
-            responseIdBase64 = responseIdBase64.replace(/=/g, '');
-            logger.info('[Passkey] 移除填充字符后的credentialID', {
-                userId: user.id,
-                finalId: responseIdBase64.substring(0, 10) + '...',
-                finalLength: responseIdBase64.length
-            });
-            
-            logger.info('[Passkey] 直接使用id字段', {
-                userId: user.id,
-                idLength: response.id.length,
-                id: response.id.substring(0, 10) + '...',
-                idValue: response.id,
-                finalId: responseIdBase64.substring(0, 10) + '...'
-            });
-        } else {
-            // 如果都没有，记录错误信息
-            logger.error('[Passkey] 认证响应中缺少credentialID', {
-                userId: user.id,
-                responseKeys: Object.keys(response),
-                response: JSON.stringify(response, null, 2),
-                responseType: typeof response,
-                hasRawId: !!response.rawId,
-                hasId: !!response.id,
-                hasResponse: !!response.response,
-                rawIdType: typeof response.rawId,
-                rawIdIsArray: Array.isArray(response.rawId)
-            });
-            throw new Error('认证响应中缺少credentialID');
+        const normalizedCredentialId = normalizeCredentialId(formattedResponse.id);
+        if (!normalizedCredentialId) {
+            throw new Error('认证失败：无效的 credentialID');
         }
-        
-        logger.info('[Passkey] 提取到credentialID', {
-            userId: user.id,
-            responseIdBase64: responseIdBase64.substring(0, 10) + '...',
-            hasRawId: !!response.rawId,
-            hasId: !!response.id
-        });
-        
-        // 修复：确保所有用户认证器的credentialID都是正确的base64url格式
-        const validAuthenticators = userAuthenticators.filter(auth => {
-            if (!auth.credentialID || typeof auth.credentialID !== 'string') {
-                logger.warn('[Passkey] 发现无效的credentialID，跳过', {
-                    userId: user.id,
-                    credentialID: auth.credentialID,
-                    type: typeof auth.credentialID
-                });
-                return false;
-            }
-            return true;
-        });
-        
-        // 尝试多种匹配方式
-        let authenticator = validAuthenticators.find(
-            auth => auth.credentialID === responseIdBase64
+
+        const authenticator = user.passkeyCredentials?.find(
+            cred => cred.credentialID === normalizedCredentialId
         );
-        
-        // 如果直接匹配失败，尝试base64解码后匹配
-        if (!authenticator) {
-            try {
-                const responseIdBuffer = Buffer.from(responseIdBase64, 'base64url');
-                const responseIdBase64Standard = responseIdBuffer.toString('base64');
-                
-                authenticator = validAuthenticators.find(auth => {
-                    try {
-                        const authBuffer = Buffer.from(auth.credentialID, 'base64url');
-                        const authBase64Standard = authBuffer.toString('base64');
-                        return authBase64Standard === responseIdBase64Standard;
-                    } catch {
-                        return false;
-                    }
-                });
-                
-                if (authenticator) {
-                    logger.info('[Passkey] 通过base64转换找到匹配的认证器', {
-                        userId: user.id,
-                        responseIdBase64: responseIdBase64.substring(0, 10) + '...',
-                        authCredentialID: authenticator.credentialID.substring(0, 10) + '...'
-                    });
-                }
-            } catch (error) {
-                logger.warn('[Passkey] base64转换匹配失败', {
-                    userId: user.id,
-                    error: error instanceof Error ? error.message : String(error)
-                });
-            }
-        }
 
         if (!authenticator) {
-            // 新增详细错误信息，便于前后端比对
-            const allCredentialIDs = validAuthenticators.map(a => a.credentialID);
-            logger.error('[Passkey] 找不到匹配的认证器', {
-                userId: user.id,
-                responseIdBase64: responseIdBase64.substring(0, 20) + '...',
-                allCredentialIDs: allCredentialIDs.map(id => id.substring(0, 10) + '...'),
-                responseKeys: Object.keys(response),
-                validAuthenticatorsCount: validAuthenticators.length,
-                totalAuthenticatorsCount: userAuthenticators.length
-            });
-            throw new Error(`找不到匹配的认证器 | 前端credentialID: ${responseIdBase64} | 后端credentialID列表: ${JSON.stringify(allCredentialIDs)}`);
+            throw new Error('未找到匹配的 Passkey');
         }
 
-        // 二次检验：确保credentialID格式完全符合要求
-        logger.info('[Passkey] 开始二次检验credentialID格式', {
-            userId: user.id,
-            responseId: responseIdBase64.substring(0, 10) + '...',
-            responseIdLength: responseIdBase64.length,
-            authenticatorId: authenticator.credentialID.substring(0, 10) + '...',
-            authenticatorIdLength: authenticator.credentialID.length
-        });
-        
-        // 检验1：确保responseIdBase64是纯base64url格式
-        if (!responseIdBase64.match(/^[A-Za-z0-9_-]+$/)) {
-            logger.error('[Passkey] 二次检验失败：responseIdBase64不是纯base64url格式', {
-                userId: user.id,
-                responseIdBase64: responseIdBase64,
-                containsPlus: responseIdBase64.includes('+'),
-                containsSlash: responseIdBase64.includes('/'),
-                containsEquals: responseIdBase64.includes('=')
-            });
-            throw new Error('Credential ID格式验证失败：不是有效的base64url格式');
-        }
-        
-        // 检验2：确保authenticator.credentialID也是纯base64url格式
-        if (!authenticator.credentialID.match(/^[A-Za-z0-9_-]+$/)) {
-            logger.error('[Passkey] 二次检验失败：authenticator.credentialID不是纯base64url格式', {
-                userId: user.id,
-                authenticatorCredentialID: authenticator.credentialID,
-                containsPlus: authenticator.credentialID.includes('+'),
-                containsSlash: authenticator.credentialID.includes('/'),
-                containsEquals: authenticator.credentialID.includes('=')
-            });
-            throw new Error('存储的Credential ID格式验证失败：不是有效的base64url格式');
-        }
-        
-        // 检验3：尝试解码验证两个credentialID是否等价
         try {
-            const responseBuffer = Buffer.from(responseIdBase64, 'base64url');
-            const authenticatorBuffer = Buffer.from(authenticator.credentialID, 'base64url');
-            
-            if (!responseBuffer.equals(authenticatorBuffer)) {
-                logger.error('[Passkey] 二次检验失败：credentialID不匹配', {
-                    userId: user.id,
-                    responseIdBase64: responseIdBase64.substring(0, 10) + '...',
-                    authenticatorCredentialID: authenticator.credentialID.substring(0, 10) + '...',
-                    responseBufferLength: responseBuffer.length,
-                    authenticatorBufferLength: authenticatorBuffer.length
-                });
-                throw new Error('Credential ID不匹配');
-            }
-            
-            logger.info('[Passkey] 二次检验通过：credentialID格式和内容都正确', {
-                userId: user.id,
-                bufferLength: responseBuffer.length
-            });
-        } catch (error) {
-            logger.error('[Passkey] 二次检验失败：credentialID解码或比较失败', {
-                userId: user.id,
-                error: error instanceof Error ? error.message : String(error)
-            });
-            throw new Error('Credential ID验证失败：' + (error instanceof Error ? error.message : String(error)));
-        }
-        
-        let verification: VerifiedAuthenticationResponse;
-        try {
-            // 确保传递给verifyAuthenticationResponse的response对象中的所有credentialID相关字段都是正确的格式
-            const responseToVerify = {
-                ...response,
-                id: responseIdBase64 // 使用我们处理过的credentialID
-            };
-            
-            // 处理rawId字段：如果存在且不为空，转换为正确的ArrayBuffer格式；如果为空或无效，则移除
-            if (response.rawId) {
-                // 检查rawId是否为空字符串或无效值
-                if (response.rawId === '' || response.rawId === null || response.rawId === undefined) {
-                    logger.info('[Passkey] rawId为空或无效，移除该字段', {
-                        userId: user.id,
-                        rawIdValue: response.rawId
-                    });
-                    delete responseToVerify.rawId;
-                } else {
-                    try {
-                        // 将处理过的credentialID转换回ArrayBuffer
-                        const rawIdBuffer = Buffer.from(responseIdBase64, 'base64url');
-                        responseToVerify.rawId = rawIdBuffer;
-                        
-                        logger.info('[Passkey] 成功转换rawId为ArrayBuffer', {
-                            userId: user.id,
-                            rawIdBufferLength: rawIdBuffer.length,
-                            rawIdType: typeof responseToVerify.rawId
-                        });
-                    } catch (error) {
-                        logger.error('[Passkey] 转换rawId失败', {
-                            userId: user.id,
-                            error: error instanceof Error ? error.message : String(error)
-                        });
-                        // 如果转换失败，移除rawId字段
-                        delete responseToVerify.rawId;
-                    }
-                }
-            }
-            
-            // 详细记录传递给库的response对象
-            logger.info('[Passkey] 传递给verifyAuthenticationResponse的完整response对象', {
-                userId: user.id,
-                responseToVerify: {
-                    id: responseToVerify.id,
-                    type: responseToVerify.type,
-                    responseKeys: Object.keys(responseToVerify.response || {}),
-                    rawId: responseToVerify.rawId ? '存在' : '不存在',
-                    rawIdType: typeof responseToVerify.rawId,
-                    rawIdLength: responseToVerify.rawId?.length || 0
-                },
-                originalResponse: {
-                    id: response.id,
-                    type: response.type,
-                    responseKeys: Object.keys(response.response || {}),
-                    rawId: response.rawId ? '存在' : '不存在',
-                    rawIdType: typeof response.rawId,
-                    rawIdLength: response.rawId?.length || 0
-                }
-            });
-            
-            logger.info('[Passkey] 准备调用verifyAuthenticationResponse', {
-                userId: user.id,
-                responseId: responseIdBase64.substring(0, 10) + '...',
-                authenticatorCredentialID: authenticator.credentialID.substring(0, 10) + '...',
-                responseKeys: Object.keys(responseToVerify)
-            });
-            
-            verification = await verifyAuthenticationResponse({
-                response: responseToVerify,
-                expectedChallenge: user.pendingChallenge,
+            const verification = await verifyAuthenticationResponse({
+                response: formattedResponse,
+                expectedChallenge: user.pendingChallenge || '',
                 expectedOrigin: requestOrigin || getRpOrigin(),
                 expectedRPID: getRpId(),
-                authenticator: {
-                    credentialID: Buffer.from(authenticator.credentialID, 'base64url'),
-                    credentialPublicKey: Buffer.from(authenticator.credentialPublicKey, 'base64'),
+                requireUserVerification: false, // 改为 false 以支持无生物识别传感器的设备
+                credential: {
+                    id: authenticator.credentialID,
+                    publicKey: Buffer.from(authenticator.credentialPublicKey, 'base64url'),
                     counter: authenticator.counter
-                } as any
-            } as any);
-        } catch (error) {
-            logger.error('验证认证响应失败:', error);
-            throw new Error('验证认证响应失败');
-        }
-
-        if (verification.verified) {
-            // 更新认证器计数器
-            const updatedCredentials = userAuthenticators.map(cred =>
-                cred.credentialID === responseIdBase64
-                    ? { ...cred, counter: verification.authenticationInfo.newCounter }
-                    : cred
-            );
-
-            // 更新用户记录
-            await UserStorage.updateUser(user.id, {
-                passkeyCredentials: updatedCredentials,
-                pendingChallenge: undefined
+                }
             });
-        }
 
-        return verification;
+            const { verified, authenticationInfo } = verification;
+
+            if (verified) {
+                // 更新计数器
+                authenticator.counter = authenticationInfo.newCounter;
+                await UserStorage.updateUser(user.id, {
+                    passkeyCredentials: user.passkeyCredentials,
+                    pendingChallenge: ''
+                });
+
+                return verification;
+            }
+
+            throw new Error('认证验证失败');
+        } catch (error) {
+            logger.error('[PasskeyService] verifyAuthentication 失败:', error);
+            throw error;
+        }
     }
 
     // 删除认证器
