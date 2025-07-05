@@ -14,6 +14,8 @@ export const PasskeySetup: React.FC = () => {
     const {
         credentials,
         isLoading,
+        isSupported,
+        supportChecked,
         loadCredentials,
         registerAuthenticator,
         removeAuthenticator,
@@ -21,7 +23,11 @@ export const PasskeySetup: React.FC = () => {
         showModal,
         setShowModal,
         currentCredentialId,
-        setCurrentCredentialId
+        setCurrentCredentialId,
+        showDebugModal,
+        setShowDebugModal,
+        debugInfos,
+        addDebugInfo
     } = usePasskey();
     const { showToast } = useToast();
 
@@ -33,6 +39,12 @@ export const PasskeySetup: React.FC = () => {
     useEffect(() => {
         loadCredentials();
     }, [loadCredentials]);
+
+    useEffect(() => {
+        if (supportChecked && !isSupported) {
+            showToast('您的浏览器不支持 Passkey', 'error');
+        }
+    }, [supportChecked, isSupported, showToast]);
 
     // 打印 credentials 用于线上排查
     useEffect(() => {

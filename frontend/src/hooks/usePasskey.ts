@@ -20,6 +20,7 @@ interface UsePasskeyReturn {
     isLoading: boolean;
     isSupported: boolean;
     hasAutofillSupport: boolean;
+    supportChecked: boolean;
     loadCredentials: () => Promise<void>;
     registerAuthenticator: (name: string) => Promise<void>;
     removeAuthenticator: (id: string) => Promise<void>;
@@ -40,6 +41,7 @@ export const usePasskey = (): UsePasskeyReturn & {
     const [isLoading, setIsLoading] = useState(false);
     const [isSupported, setIsSupported] = useState(false);
     const [hasAutofillSupport, setHasAutofillSupport] = useState(false);
+    const [supportChecked, setSupportChecked] = useState(false);
     const { showToast } = useToast();
     const { loginWithToken } = useAuth();
 
@@ -56,7 +58,7 @@ export const usePasskey = (): UsePasskeyReturn & {
             const autofillSupport = await browserSupportsWebAuthnAutofill();
             setIsSupported(webauthnSupport);
             setHasAutofillSupport(autofillSupport);
-            
+            setSupportChecked(true);
             addDebugInfo({
                 action: '检查浏览器支持',
                 webauthnSupport,
@@ -325,6 +327,7 @@ export const usePasskey = (): UsePasskeyReturn & {
         isLoading,
         isSupported,
         hasAutofillSupport,
+        supportChecked,
         loadCredentials,
         registerAuthenticator,
         removeAuthenticator,
