@@ -9,7 +9,7 @@ import Footer from './components/Footer';
 import PublicIP from './components/PublicIP';
 import UserManagement from './components/UserManagement';
 import TOTPManager from './components/TOTPManager';
-import { TOTPStatus } from './types/auth';
+import { TOTPStatus, User } from './types/auth';
 import MobileNav from './components/MobileNav';
 import ApiDocs from './components/ApiDocs';
 import LogShare from './components/LogShare';
@@ -136,6 +136,11 @@ const App: React.FC = () => {
   const [totpStatus, setTotpStatus] = useState<TOTPStatus | null>(null);
   const [showWatermark, setShowWatermark] = useState(false);
 
+  // 类型守卫函数
+  const isAdmin = (user: User | null): user is User & { role: 'admin' } => {
+    return user?.role === 'admin';
+  };
+
   useEffect(() => {
     if (!loading) {
       setIsInitialized(true);
@@ -190,7 +195,7 @@ const App: React.FC = () => {
   }
 
   // 如果是管理员，直接渲染主页
-  if (user?.role === 'admin') {
+  if (isAdmin(user)) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 relative overflow-hidden">
         <BackgroundParticles />
@@ -298,7 +303,7 @@ const App: React.FC = () => {
                 }
               />
               <Route path="/admin/users" element={
-                user?.role === 'admin' ? (
+                isAdmin(user) ? (
                   <motion.div
                     variants={pageVariants}
                     initial="initial"
@@ -492,7 +497,7 @@ const App: React.FC = () => {
               }
             />
             <Route path="/admin/users" element={
-              user?.role === 'admin' ? (
+              isAdmin(user) ? (
                 <motion.div
                   variants={pageVariants}
                   initial="initial"

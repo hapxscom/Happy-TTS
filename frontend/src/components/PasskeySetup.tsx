@@ -104,7 +104,10 @@ export const PasskeySetup: React.FC = () => {
                                     <KeyRoundIcon className="w-5 h-5 text-indigo-500" />
                                     <div>
                                         <div className="font-semibold text-base">{credential.name}</div>
-                                        <div className="text-xs text-gray-400 mt-1">添加时间：{formatDate(credential.createdAt)}</div>
+                                        <div className="text-xs text-gray-400 mt-1">
+                                            {credential.deviceType === 'multiDevice' ? '多设备' : '单设备'} 
+                                            {credential.backedUp ? ' · 已备份' : ''}
+                                        </div>
                                     </div>
                                 </div>
                                 <button
